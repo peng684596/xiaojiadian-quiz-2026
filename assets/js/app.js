@@ -13,11 +13,11 @@
   /* 记忆曲线间隔（分钟）：5分钟、30分钟、12小时、1天、2天、4天、7天、15天 */
   var IV = [5, 30, 720, 1440, 2880, 5760, 10080, 21600];
 
-  var state = { rec: {}, star: {}, cleared: {}, days: {} };
+  var state = { rec: {}, star: {}, cleared: {}, days: {}, pra: {} };
   function load() {
     try {
       var s = JSON.parse(localStorage.getItem(KEY));
-      if (s && s.rec) state = { rec: s.rec || {}, star: s.star || {}, cleared: s.cleared || {}, days: s.days || {} };
+      if (s && s.rec) state = { rec: s.rec || {}, star: s.star || {}, cleared: s.cleared || {}, days: s.days || {}, pra: s.pra || {} };
     } catch (e) { }
   }
   function save() { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { alert("本地存储写入失败：" + e.message); } }
@@ -94,6 +94,7 @@
   var nav = document.getElementById("nav");
   var examTimer = null;
   function route() {
+    leaveSession();
     if (examTimer) { clearInterval(examTimer); examTimer = null; }
     var h = location.hash || "#/home";
     var qi = h.indexOf("?");
@@ -134,17 +135,47 @@
       var list = DATA.filter(function (x) { return x.type === s.key; });
       var done = list.filter(function (x) { var r = recOf(x.id); return r && r.n > 0; }).length;
       var pct = list.length ? Math.round(done / list.length * 100) : 0;
+      var r = resumeOf(s.key);
       return "<div class='item'><span class='no'>" + esc(s.label) + "</span><span class='tx'><span class='t'>" + done + " / " + list.length + " 题已练</span>" +
         "<div class='prog' style='margin-top:6px'><i style='width:" + pct + "%'></i></div></span>" +
+        (r ? "<button class='btn sm pri' data-resume='" + s.key + "'>继续（第" + (r.idx + 1) + "题）</button>" : "") +
         "<a class='btn sm' href='#/practice?tp=" + s.key + "'>练习</a></div>";
     }).join("");
     app.appendChild(card("<h2>分型进度</h2><div class='list'>" + rows + "</div>"));
+    Array.prototype.forEach.call(app.querySelectorAll("[data-resume]"), function (btn) {
+      btn.onclick = function () {
+        var tkey = btn.dataset.resume;
+        var r = resumeOf(tkey); if (!r) return;
+        var lab = SECTIONS.filter(function (s) { return s.key === tkey; })[0].label;
+        startQuiz({ title: lab, list: r.list, startIdx: r.idx, keepOrd: true, shuffleOpt: true, shuffleOrd: false,
+          key: tkey, backHash: "#/practice?tp=" + tkey, enterHash: "#/practice?tp=" + tkey + "&run=1" });
+      };
+    });
   }
 
   /* SECTION: quiz-engine —— 练习引擎（分型练习 / 错题重练 / 收藏练习 / 记忆复习共用） */
+  var CUR = null; /* 当前练习会话 {key, ids, idx}，退出时落盘为断点 */
+  function leaveSession() {
+    if (CUR && CUR.key) {
+      state.pra[CUR.key] = { ids: CUR.ids, idx: CUR.idx, t: Date.now() };
+      save();
+    }
+    CUR = null;
+  }
+  function resumeOf(tp) {
+    var pr = state.pra[tp];
+    if (!pr || !pr.ids || !pr.ids.length) return null;
+    var list = pr.ids.map(byId).filter(Boolean);
+    if (!list.length) { delete state.pra[tp]; return null; }
+    return { list: list, idx: Math.min(Math.max(0, pr.idx || 0), list.length - 1), done: list.length };
+  }
   function startQuiz(opts) {
-    var list = opts.shuffleOrd ? shuffle(opts.list) : opts.list.slice();
-    var idx = 0, answered = {};
+    var list = opts.startIdx != null && opts.keepOrd ? opts.list.slice() : (opts.shuffleOrd ? shuffle(opts.list) : opts.list.slice());
+    var idx = opts.startIdx || 0, answered = {};
+    CUR = opts.key ? { key: opts.key, ids: list.map(function (q) { return q.id; }), idx: idx } : null;
+    if (CUR && opts.enterHash && location.hash !== opts.enterHash) {
+      try { history.replaceState(null, "", opts.enterHash); } catch (e) { }
+    }
     var perms = {};
     list.forEach(function (q) {
       var ch = choices(q);
@@ -154,12 +185,44 @@
     function cur() { return list[idx]; }
     function ansStr(q, sel) { return sel.slice().sort().join(","); }
     function isOk(q, sel) { return ansStr(q, sel) === q.ans; }
+    function openPalette() {
+      var ov = document.createElement("div");
+      ov.className = "card";
+      ov.style.cssText = "position:fixed;inset:0;background:rgba(250,247,240,.97);z-index:50;overflow:auto;padding:18px";
+      var cells = list.map(function (q2, i) {
+        var s2 = answered[q2.id];
+        var cls = i === idx ? " on" : "";
+        var extra = "";
+        if (s2 && i !== idx) extra = s2.ok ? ";border-color:#3e7a52;color:#3e7a52" : ";border-color:#a54235;color:#a54235";
+        return "<button class='chip" + cls + "' style='" + extra + "' data-i='" + i + "'>" + (i + 1) + "</button>";
+      }).join("");
+      var na = Object.keys(answered).length;
+      ov.innerHTML = "<h2>答题卡</h2><div class='sub'>已作答 " + na + " / " + list.length + "（绿=对 红=错）。点题位或输入题号跳转</div>" +
+        "<div class='chips' id='palette'>" + cells + "</div>" +
+        "<div class='row' style='margin-top:14px'><input type='number' id='jidx' min='1' max='" + list.length + "' placeholder='本会话第几题' style='width:130px'><button class='btn pri' id='jgo'>跳转</button><button class='btn' id='pclose'>关闭</button></div>";
+      app.appendChild(ov);
+      ov.querySelector("#palette").onclick = function (e) {
+        var t = e.target;
+        if (t.dataset && t.dataset.i) { idx = +t.dataset.i; render(); }
+      };
+      ov.querySelector("#jgo").onclick = function () {
+        var n = parseInt(ov.querySelector("#jidx").value, 10);
+        if (!n || n < 1 || n > list.length) return;
+        idx = n - 1; render();
+      };
+      ov.querySelector("#pclose").onclick = function () { render(); };
+    }
     function render() {
       app.innerHTML = "";
+      if (CUR && CUR.key) {
+        CUR.idx = idx;
+        state.pra[CUR.key] = { ids: CUR.ids, idx: idx, t: Date.now() };
+        save();
+      } else if (CUR) { CUR.idx = idx; }
       var q = cur();
       var head = card("<div class='bar'><div class='qmeta'><span class='tag b'>" + esc(opts.title) + "</span><span class='tag'>" + typeLabel(q.type) + "</span><span class='tag'>原编号 " + q.no + " · 第 " + q.page + " 页</span>" + ((q.fig || q.figfile) ? "<span class='tag o'>含图</span>" : "") + "</div>" +
-        "<div class='row' style='margin-left:auto'><button class='btn sm' id='st'>" + (state.star[q.id] ? "★ 已收藏" : "☆ 收藏") + "</button><a class='btn sm' href='" + opts.backHash + "'>退出</a></div></div>" +
-        "<div class='bar'><span class='muted'>第 " + (idx + 1) + " / " + list.length + " 题</span><div class='prog'><i style='width:" + Math.round(idx / list.length * 100) + "%'></i></div></div>" +
+        "<div class='row' style='margin-left:auto'><button class='btn sm' id='pal'>答题卡</button><button class='btn sm' id='st'>" + (state.star[q.id] ? "★ 已收藏" : "☆ 收藏") + "</button><a class='btn sm' href='" + opts.backHash + "'>退出</a></div></div>" +
+        "<div class='bar'><span class='muted' id='poslab'>第 " + (idx + 1) + " / " + list.length + " 题</span><div class='prog'><i style='width:" + Math.round(idx / list.length * 100) + "%'></i></div></div>" +
         "<div class='stem'>" + esc(q.stem) + "</div><div id='figbox'></div><div class='opts' id='opts'></div><div id='fb'></div>" +
         "<div class='row' style='margin-top:14px'><button class='btn' id='prev' " + (idx === 0 ? "disabled" : "") + ">上一题</button>" +
         (q.type === "multi" ? "<button class='btn pri' id='commit' style='display:none'>提交本题</button>" : "") +
@@ -210,6 +273,7 @@
         var expHtml = q.exp ? "<div class='muted' style='margin-top:6px'>解析：" + esc(q.exp) + "</div>" : "";
         head.querySelector("#fb").innerHTML = "<div class='fb " + (st.ok ? "ok" : "bad") + "'>" + (st.ok ? "回答正确。" : "回答错误，正确答案：" + esc(q.ans) + "。") + expHtml + "</div>";
       }
+      head.querySelector("#pal").onclick = openPalette;
       head.querySelector("#st").onclick = function () {
         if (state.star[q.id]) delete state.star[q.id]; else state.star[q.id] = 1;
         save(); render();
@@ -254,10 +318,16 @@
       return startQuiz({
         title: tp === "all" ? "全部题型" : (tp === "single" ? "单项选择题" : tp === "multi" ? "多项选择题" : "判断题"),
         list: pool, shuffleOpt: q.shuf !== "0", shuffleOrd: q.ord !== "0",
-        backHash: "#/practice?tp=" + tp
+        key: tp, backHash: "#/practice?tp=" + tp, enterHash: "#/practice?tp=" + tp + "&run=1"
       });
     }
+    var rz = resumeOf(tp);
+    if (rz) {
+      var rdone = 0;
+      rz.list.forEach(function (x2, i2) { var r2 = recOf(x2.id); if (r2 && r2.n > 0 && i2 <= rz.idx) rdone++; });
+    }
     app.appendChild(card("<h2>分型练习</h2><div class='sub'>选择题型后开始；默认开启选项乱序与题目乱序，答完即时判分并计入记忆曲线。多选题点选选项后提交本题</div>" +
+      (rz ? "<div class='row' style='margin-bottom:10px'><button class='btn pri' id='resume'>继续上次练习<span id='resumelab'>（第 " + (rz.idx + 1) + " 题 / 共 " + rz.done + " 题）</span></button><button class='btn' id='restart'>从头开始</button></div>" : "") +
       "<div class='chips' id='tps'>" + [["all", "全部题型"], ["single", "单项选择"], ["multi", "多项选择"], ["judge", "判断"]].map(function (p) { return "<button class='chip" + (tp === p[0] ? " on" : "") + "' data-tp='" + p[0] + "'>" + p[1] + "（" + (p[0] === "all" ? DATA.length : countOf(p[0])) + "）</button>"; }).join("") + "</div>" +
       "<div class='row' style='margin-top:14px'><label class='ck'><input type='checkbox' id='shuf' checked>选项乱序</label><label class='ck'><input type='checkbox' id='ord' checked>题目乱序</label>" +
       "<button class='btn pri' data-primary-action id='go'>开始练习（" + pool.length + " 题）</button></div>" +
@@ -268,6 +338,20 @@
     document.getElementById("tps").onclick = function (e) {
       var t = e.target; if (!t.dataset || !t.dataset.tp) return;
       go("#/practice?tp=" + t.dataset.tp);
+    };
+    var rb = document.getElementById("resume");
+    if (rb) rb.onclick = function () {
+      var r = resumeOf(tp); if (!r) return;
+      startQuiz({
+        title: tp === "all" ? "全部题型" : (tp === "single" ? "单项选择题" : tp === "multi" ? "多项选择题" : "判断题"),
+        list: r.list, idx0: r.idx, startIdx: r.idx, keepOrd: true, shuffleOpt: true, shuffleOrd: false,
+        key: tp, backHash: "#/practice?tp=" + tp, enterHash: "#/practice?tp=" + tp + "&run=1"
+      });
+    };
+    var xb = document.getElementById("restart");
+    if (xb) xb.onclick = function () {
+      delete state.pra[tp]; save();
+      go("#/practice?tp=" + tp + "&shuf=1&ord=1&go=1");
     };
     document.getElementById("go").onclick = function () {
       var s = document.getElementById("shuf").checked ? "1" : "0";
@@ -501,7 +585,7 @@
           var o = JSON.parse(rd.result);
           if (!o || o.app !== "xjdquiz2026" || !o.state || !o.state.rec) throw new Error("文件格式不符（需为本站 2026 版导出的备份）");
           if (!confirm("导入将覆盖本机现有学习数据，确定继续？")) return;
-          state = { rec: o.state.rec || {}, star: o.state.star || {}, cleared: o.state.cleared || {}, days: o.state.days || {} };
+          state = { rec: o.state.rec || {}, star: o.state.star || {}, cleared: o.state.cleared || {}, days: o.state.days || {}, pra: o.state.pra || {} };
           save(); route();
         } catch (err) { alert("导入失败：" + err.message); }
       };
@@ -509,7 +593,7 @@
     };
     document.getElementById("rst").onclick = function () {
       if (!confirm("将清空本机全部练习记录、错题、收藏与统计，且不可恢复。确定？")) return;
-      state = { rec: {}, star: {}, cleared: {}, days: {} };
+      state = { rec: {}, star: {}, cleared: {}, days: {}, pra: {} };
       save(); route();
     };
   }
